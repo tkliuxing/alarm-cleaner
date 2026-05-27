@@ -58,8 +58,8 @@ USER_AGENT = (
 
 # Search 默认参数（来源：抓取了页面 datagrid('options').queryParams）
 DEFAULT_SEARCH_PARAMS = {
-    "OrgAndCarList.OrgId": "1",            # 1 = 根组织
-    "OrgAndCarList.Text": "",
+    "OrgAndCarList.OrgId": "7250",            # 1 = 根组织
+    "OrgAndCarList.Text": "土右运管所",
     "OrgAndCarList.CarId": "",
     "OrgAndCarList.CarNun": "",
     "QuickChoice": "0",
@@ -97,6 +97,31 @@ DEFAULT_SEARCH_PARAMS = {
     "IsMisreport.SelectedValue": "-1",
 }
 
+DEFAULT_SEARCH_PARAMS2 = {
+    'OrgAndCarList.OrgId': '7250',
+    'OrgAndCarList.Text': '土右运管所',
+    'OrgAndCarList.CarId': '',
+    'OrgAndCarList.CarNun': '',
+    'QuickChoice': '0',
+    'RptTimeCtrl.BeginTime': '2026-05-27 00:00:00',
+    'RptTimeCtrl.EndTime': '2026-05-28 00:00:00',
+    'alarmDetail_DriverName.Value': '',
+    'alarmDetail_DriverId.Value': '',
+    'Speed.Value': '',
+    'VehicleTypeCode.SelectedValue': '0',
+    'NickName.Value': '',
+    'AlarmFlagTreeCheckBox_AlarmFlag': '8_4',
+    'AlarmFlag.Value': '0,1,1_1,1_2,1_4,1_8,1_16,1_32,1_64,1_32768,1_65536,2,2_1073741824,2_4294967296,2_8589934592,2_17179869184,2_34359738368,2_68719476736,2_274877906944,2_70368744177664,2_140737488355328,2_281474976710656,2_562949953421312,2_2305843009213693952,2_4611686018427387904,2_2147483648,4,4_1,4_2,4_4,4_8,4_16,8,8_1,8_2,8_4',
+    'AlarmLevel.SelectedValue': '0',
+    'DangerType.SelectedValue': '0',
+    'UPTicket.SelectedValue': '0',
+    'ProcessModel.SelectedValue': '0',
+    'ProStatus.SelectedValue': '2',
+    'ProName.Value': '',
+    'IsMisreport.SelectedValue': '-1',
+    'HasReceiveAttachmentOption.SelectedValue': '0',
+    'HasReceiveAttachmentNum.Value': '',
+}
 
 def encrypt_password(plain: str) -> str:
     """对密码做 MD5 后再用 RSA(PKCS#1 v1.5) 加密，与前端 JEncryptPwd 行为一致。"""
@@ -176,13 +201,13 @@ def login(session: requests.Session, username: str, password: str) -> None:
 
 
 def search_alarms(
-    session: requests.Session,
-    begin_time: str,
-    end_time: str,
-    page: int = 1,
-    rows: int = 50,
-    extra: dict | None = None,
-) -> dict:
+        session: requests.Session,
+        begin_time: str,
+        end_time: str,
+        page: int = 1,
+        rows: int = 50,
+        extra: dict | None = None,
+    ) -> dict:
     """查询报警，返回 {"total": int, "rows": [...]}。"""
     params = dict(DEFAULT_SEARCH_PARAMS)
     params["RptTimeCtrl.BeginTime"] = begin_time
@@ -198,6 +223,41 @@ def search_alarms(
         data=params,
         headers={
             "Referer": f"{BASE}/TopGps/Report/AlarmProcessQuery",
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "rows" not in data:
+        raise RuntimeError(f"搜索接口未返回 rows: {data}")
+    return data
+
+
+def search_alarms2(
+        session: requests.Session,
+        begin_time: str,
+        end_time: str,
+        page: int = 1,
+        rows: int = 50,
+        extra: dict | None = None,
+    ) -> dict:
+    """查询报警，返回 {"total": int, "rows": [...]}。"""
+    params = dict(DEFAULT_SEARCH_PARAMS2)
+    params["RptTimeCtrl.BeginTime"] = begin_time
+    params["RptTimeCtrl.EndTime"] = end_time
+    params["ProStatus.SelectedValue"] = '2'
+    params["page"] = str(page)
+    params["rows"] = str(rows)
+    if extra:
+        params.update(extra)
+
+    resp = session.post(
+        f"{BASE}/CGO8/SafeAnly/SafeAlarmProRpt/Search",
+        data=params,
+        headers={
+            "Referer": f"{BASE}/CGO8/SafeAnly/SafeAlarmProRpt",
             "X-Requested-With": "XMLHttpRequest",
             "Accept": "application/json, text/javascript, */*; q=0.01",
         },
@@ -235,6 +295,31 @@ def fetch_verify_token(session: requests.Session, ids_param: str) -> str:
     return m.group(1), url
 
 
+def fetch_verify_token2(session: requests.Session) -> str:
+    """打开 AlarmEXProc 弹窗页，从返回的 HTML 中抓 __RequestVerificationToken。"""
+    url = (
+        f"{BASE}/CGO8/SafeAnly/SafeAlarmProRpt/AlarmPro?pop=1&popName=_dialog_window_"
+    )
+    resp = session.get(
+        url,
+        headers={"Referer": f"{BASE}/CGO8/SafeAnly/SafeAlarmProRpt"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    m = _TOKEN_RE.search(resp.text)
+    if not m:
+        raise RuntimeError("未能从弹窗页面中找到 __RequestVerificationToken")
+    return m.group(1), url
+
+
+def build_alarm_id2(rows: list[dict]) -> str:
+    """按页面前端逻辑拼接：uniqueid，逗号分隔。"""
+    parts = []
+    for r in rows:
+        parts.append(r.get("uniqueid") or r.get("alarmid") or "")
+    return ",".join(parts)
+
+
 def build_alarm_id(rows: list[dict]) -> str:
     """按页面前端逻辑拼接：uniqueid|begintime，逗号分隔。"""
     parts = []
@@ -246,11 +331,11 @@ def build_alarm_id(rows: list[dict]) -> str:
 
 
 def supplement_process(
-    session: requests.Session,
-    rows: list[dict],
-    pro_mode: str = "补充处理",
-    remark: str = " ",
-) -> str:
+        session: requests.Session,
+        rows: list[dict],
+        pro_mode: str = "补充处理",
+        remark: str = " ",
+    ) -> str:
     """对给定的报警行执行"补充处理"。返回响应文本。"""
     if not rows:
         return ""
@@ -281,16 +366,50 @@ def supplement_process(
     return resp.text
 
 
+def supplement_process2(
+        session: requests.Session,
+        rows: list[dict],
+        pro_mode: str = "补充处理",
+        remark: str = " ",
+    ) -> str:
+    """对给定的报警行执行"补充处理"。返回响应文本。"""
+    if not rows:
+        return ""
+    # ids 参数用 rownum（前端用的就是这个；服务器结合 session 还原数据）
+
+    token, ref_url = fetch_verify_token2(session)
+    alarm_id = build_alarm_id2(rows)
+
+    resp = session.post(
+        f"{BASE}/CGO8/SafeAnly/SafeAlarmProRpt/AlarmPro"
+        f"?pop=1&popName=_dialog_window_normal",
+        data={
+            "__RequestVerificationToken": token,
+            "ProMode": pro_mode,
+            "UniqueId": alarm_id,
+            "Remark": remark,
+        },
+        headers={
+            "Referer": ref_url,
+            "Origin": BASE,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        },
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.text
+
+
 def process_once(
-    session: requests.Session,
-    begin_time: str,
-    end_time: str,
-    org_id: str = "1",
-    page_size: int = 50,
-    dry_run: bool = False,
-    all_pages: bool = True,
-    log: Callable[[str], None] = print,
-) -> int:
+        session: requests.Session,
+        begin_time: str,
+        end_time: str,
+        org_id: str = "1",
+        page_size: int = 50,
+        dry_run: bool = False,
+        all_pages: bool = True,
+        log: Callable[[str], None] = print,
+    ) -> int:
     """执行一轮完整的查询 + 补充处理，返回本轮实际处理的行数。
 
     通过 ``log`` 回调输出进度，便于 CLI（print）与 GUI（日志窗口）复用同一逻辑。
@@ -333,6 +452,106 @@ def process_once(
     return total_done
 
 
+def process_once2(
+        session: requests.Session,
+        begin_time: str,
+        end_time: str,
+        org_id: str = "1",
+        page_size: int = 50,
+        dry_run: bool = False,
+        all_pages: bool = True,
+        log: Callable[[str], None] = print,
+    ) -> int:
+    """执行一轮完整的查询 + 补充处理，返回本轮实际处理的行数。
+
+    通过 ``log`` 回调输出进度，便于 CLI（print）与 GUI（日志窗口）复用同一逻辑。
+    调用方需保证 ``session`` 已经登录。
+    """
+    extra = {"OrgAndCarList.OrgId": org_id}
+
+    total_done = 0
+    page = 1
+    while True:
+        log(f"查询第 {page} 页 ({begin_time} ~ {end_time}) ...")
+        data = search_alarms2(
+            session,
+            begin_time=begin_time,
+            end_time=end_time,
+            page=page,
+            rows=page_size,
+            extra=extra,
+        )
+        rows = data.get("rows") or []
+        total = int(data.get("total") or 0)
+        log(f"  本页 {len(rows)} 行 / 共 {total} 行")
+        if not rows:
+            break
+
+        if not dry_run:
+            resp_text = supplement_process2(session, rows)
+            log(f"  提交完成: {resp_text[:200]}")
+            total_done += len(rows)
+        else:
+            log("  [dry-run] 跳过提交")
+
+        if not all_pages:
+            break
+        if page * page_size >= total:
+            break
+        page += 1
+        time.sleep(0.5)
+
+    return total_done
+
+
+def process_all(
+        session: requests.Session,
+        begin_time: str,
+        end_time: str,
+        org_id: str = "1",
+        page_size: int = 50,
+        dry_run: bool = False,
+        all_pages: bool = True,
+        log: Callable[[str], None] = print,
+        run_type1: bool = True,
+        run_type2: bool = True,
+        on_error: Callable[[Exception], None] | None = None,
+    ) -> int:
+    """在同一个已登录 session 上，依次运行所选的两类报警处理，返回总处理行数。
+
+    - ``run_type1``：类型1·报警处理（/TopGps/Report/AlarmProcessQuery）
+    - ``run_type2``：类型2·安全报警（/CGO8/SafeAnly/SafeAlarmProRpt）
+
+    每一类独立 try/except：某一类失败不会阻断另一类；失败时若提供了
+    ``on_error`` 回调（例如重新登录），会先调用它再继续下一类。
+    """
+    tasks: list[tuple[str, Callable[..., int]]] = []
+    if run_type1:
+        tasks.append(("类型1·报警处理", process_once))
+    if run_type2:
+        tasks.append(("类型2·安全报警", process_once2))
+
+    total_done = 0
+    for name, fn in tasks:
+        log(f"----- {name} -----")
+        try:
+            total_done += fn(
+                session,
+                begin_time=begin_time,
+                end_time=end_time,
+                org_id=org_id,
+                page_size=page_size,
+                dry_run=dry_run,
+                all_pages=all_pages,
+                log=log,
+            )
+        except Exception as exc:  # noqa: BLE001 - 单类失败不应中断其它类
+            log(f"  {name} 出错：{exc}")
+            if on_error is not None:
+                on_error(exc)
+    return total_done
+
+
 def run(
     username: str,
     password: str,
@@ -342,13 +561,15 @@ def run(
     page_size: int = 50,
     dry_run: bool = False,
     all_pages: bool = True,
+    run_type1: bool = True,
+    run_type2: bool = True,
 ) -> None:
     session = make_session()
     print(f"[{datetime.now():%F %T}] 登录 {username} ...")
     login(session, username, password)
     print("登录成功。")
 
-    total_done = process_once(
+    total_done = process_all(
         session,
         begin_time=begin_time,
         end_time=end_time,
@@ -356,6 +577,8 @@ def run(
         page_size=page_size,
         dry_run=dry_run,
         all_pages=all_pages,
+        run_type1=run_type1,
+        run_type2=run_type2,
         log=lambda msg: print(f"[{datetime.now():%F %T}] {msg}"),
     )
 
@@ -374,7 +597,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--end",
         help="结束时间 yyyy-mm-dd HH:MM:SS，默认昨天 23:59:59",
     )
-    p.add_argument("--org-id", default="1", help="组织 ID，默认 1（全部）")
+    p.add_argument("--org-id", default="7250", help="组织 ID，默认 1（全部）")
     p.add_argument("--page-size", type=int, default=50)
     p.add_argument(
         "--first-page-only",
@@ -389,13 +612,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def default_time_window() -> tuple[str, str]:
-    yesterday = datetime.now() - timedelta(days=1)
-    begin = yesterday.replace(hour=0, minute=0, second=0).strftime("%Y-%m-%d %H:%M:%S")
-    end = yesterday.replace(hour=23, minute=59, second=59).strftime("%Y-%m-%d %H:%M:%S")
-    return begin, end
-
-
 def today_time_window() -> tuple[str, str]:
     """返回「今天 00:00:00 ~ 当前时刻」的时间窗，供 GUI 定时处理使用。"""
     now = datetime.now()
@@ -408,7 +624,7 @@ def today_time_window() -> tuple[str, str]:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    begin, end = default_time_window()
+    begin, end = today_time_window()
     begin = args.begin or begin
     end = args.end or end
 

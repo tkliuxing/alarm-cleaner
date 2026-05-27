@@ -94,9 +94,11 @@ class AlarmCleanerApp:
         self.user_var = tk.StringVar(value="")
         self.pwd_var = tk.StringVar(value="")
         self.interval_var = tk.StringVar(value=str(DEFAULT_INTERVAL_MIN))
-        self.org_var = tk.StringVar(value="1")
+        self.org_var = tk.StringVar(value="7250")
         self.pagesize_var = tk.StringVar(value="50")
         self.dryrun_var = tk.BooleanVar(value=False)
+        self.type1_var = tk.BooleanVar(value=True)
+        self.type2_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="已停止")
 
         pad = {"padx": 6, "pady": 4}
@@ -130,6 +132,16 @@ class AlarmCleanerApp:
             form, text="干跑（只查询不提交）", variable=self.dryrun_var
         )
         self.dryrun_check.grid(row=2, column=2, columnspan=2, sticky="w", **pad)
+
+        ttk.Label(form, text="处理类型").grid(row=3, column=0, sticky="w", **pad)
+        self.type1_check = ttk.Checkbutton(
+            form, text="类型1·报警处理", variable=self.type1_var
+        )
+        self.type1_check.grid(row=3, column=1, sticky="w", **pad)
+        self.type2_check = ttk.Checkbutton(
+            form, text="类型2·安全报警", variable=self.type2_var
+        )
+        self.type2_check.grid(row=3, column=2, columnspan=2, sticky="w", **pad)
 
         # 按钮 + 状态
         bar = ttk.Frame(self.root)
@@ -173,12 +185,26 @@ class AlarmCleanerApp:
             page_size = 50
             self.pagesize_var.set("50")
         dry_run = bool(self.dryrun_var.get())
+        run_type1 = bool(self.type1_var.get())
+        run_type2 = bool(self.type2_var.get())
+        if not (run_type1 or run_type2):
+            messagebox.showwarning("提示", "请至少选择一种处理类型。")
+            return
 
         self.stop_event.clear()
         self._set_running(True)
         self.worker = threading.Thread(
             target=self._worker,
-            args=(username, password, org_id, page_size, interval, dry_run),
+            args=(
+                username,
+                password,
+                org_id,
+                page_size,
+                interval,
+                dry_run,
+                run_type1,
+                run_type2,
+            ),
             daemon=True,
         )
         self.worker.start()
@@ -205,6 +231,8 @@ class AlarmCleanerApp:
         page_size: int,
         interval: float,
         dry_run: bool,
+        run_type1: bool,
+        run_type2: bool,
     ) -> None:
         log = self.logger.info
         try:
@@ -217,32 +245,34 @@ class AlarmCleanerApp:
             self.root.after(0, self._on_worker_stopped)
             return
 
+        def relogin(_exc: Exception) -> None:
+            """某一类处理失败时（多为 session 过期）在原 session 上重新登录。"""
+            log("尝试重新登录 ...")
+            try:
+                core.login(session, username, password)
+                log("重新登录成功。")
+            except Exception as exc2:  # noqa: BLE001
+                self.logger.error(f"重新登录失败：{exc2}")
+
         cycle = 0
         while not self.stop_event.is_set():
             cycle += 1
             begin, end = core.today_time_window()
             log(f"===== 第 {cycle} 轮开始（{begin} ~ {end}）=====")
-            try:
-                done = core.process_once(
-                    session,
-                    begin_time=begin,
-                    end_time=end,
-                    org_id=org_id,
-                    page_size=page_size,
-                    dry_run=dry_run,
-                    all_pages=True,
-                    log=log,
-                )
-                log(f"第 {cycle} 轮完成，本轮处理 {done} 行。")
-            except Exception as exc:  # noqa: BLE001 - 单轮失败不应中断循环
-                self.logger.error(f"第 {cycle} 轮出错：{exc}")
-                log("尝试重新登录 ...")
-                try:
-                    session = core.make_session()
-                    core.login(session, username, password)
-                    log("重新登录成功。")
-                except Exception as exc2:  # noqa: BLE001
-                    self.logger.error(f"重新登录失败：{exc2}")
+            done = core.process_all(
+                session,
+                begin_time=begin,
+                end_time=end,
+                org_id=org_id,
+                page_size=page_size,
+                dry_run=dry_run,
+                all_pages=True,
+                log=log,
+                run_type1=run_type1,
+                run_type2=run_type2,
+                on_error=relogin,
+            )
+            log(f"第 {cycle} 轮完成，本轮处理 {done} 行。")
 
             if self.stop_event.is_set():
                 break
@@ -266,6 +296,8 @@ class AlarmCleanerApp:
             self.org_entry,
             self.pagesize_entry,
             self.dryrun_check,
+            self.type1_check,
+            self.type2_check,
         ):
             widget.config(state=state)
         self.start_btn.config(state="disabled" if running else "normal")
