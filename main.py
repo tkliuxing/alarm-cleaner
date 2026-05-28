@@ -270,6 +270,48 @@ def search_alarms2(
     return data
 
 
+def search_chagang(
+        session: requests.Session,
+        begin_time: str,
+        end_time: str,
+        page: int = 1,
+        rows: int = 50,
+        extra: dict | None = None,
+    ) -> dict:
+    """查询报警，返回 {"total": int, "rows": [...]}。"""
+    params = {
+        "QueryType.SelectedValue": "0",
+        "QueryId.Value": "",
+        "QuickChoice": "0",
+        "UserName.Value": "",
+        "QueryPlatform.Value": "",
+        "Remark.Value": "",
+    }
+    params["RptTimeCtrl.BeginTime"] = begin_time
+    params["RptTimeCtrl.EndTime"] = end_time
+    params["IsResponse.SelectedValue"] = '2'
+    params["page"] = str(page)
+    params["rows"] = str(rows)
+    if extra:
+        params.update(extra)
+
+    resp = session.post(
+        f"{BASE}/TopGps/Report/PlatformQuery/Search",
+        data=params,
+        headers={
+            "Referer": f"{BASE}/TopGps/Report/PlatformQuery",
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "rows" not in data:
+        raise RuntimeError(f"搜索接口未返回 rows: {data}")
+    return data
+
+
 _TOKEN_RE = re.compile(
     r'name="__RequestVerificationToken"[^>]*value="([^"]+)"',
     re.IGNORECASE,
@@ -504,6 +546,152 @@ def process_once2(
     return total_done
 
 
+def fetch_verify_token_chagang(session: requests.Session, chagang_id: str):
+    """打开 SupplyReply 弹窗页，从返回的 HTML 中抓 __RequestVerificationToken。"""
+    url = (
+        f"{BASE}/TopGps/Report/PlatformQuery/SupplyReply?id={chagang_id}pop=1&popName=_dialog_window_normal"
+    )
+    resp = session.get(
+        url,
+        headers={"Referer": f"{BASE}/TopGps/Report/PlatformQuery"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    m = _TOKEN_RE.search(resp.text)
+    if not m:
+        raise RuntimeError("未能从弹窗页面中找到 __RequestVerificationToken")
+    uniq_re = re.compile(
+        r'name="UniqueId"[^>]*value="([^"]+)"',
+        re.IGNORECASE,
+    )
+    um = uniq_re.search(resp.text)
+
+    return m.group(1), url, um.group(1) if um else ''
+
+
+def calc_suanshi(suanshi: str) -> str:
+    """
+    计算简单加减法算式字符串，返回结果字符串。
+    
+    示例:
+        calc_expression("1+1=")   -> "2"
+        calc_expression("10-7=")  -> "3"
+    """
+    # 去掉末尾的等号
+    expr = expr.strip().rstrip("=")
+    
+    # 解析运算符和数字
+    for op in ("+", "-"):
+        if op in expr:
+            left, right = expr.split(op, 1)
+            a = int(left.strip())
+            b = int(right.strip())
+            result = a + b if op == "+" else a - b
+            return str(result)
+    
+    raise ValueError(f"不支持的算式格式: {expr}")
+
+
+def supplement_chagang(
+        session: requests.Session,
+        row: dict
+    ) -> str:
+    """对给定的查岗行执行"补充处理"。返回响应文本。"""
+    if not row:
+        return ""
+
+    chagang_id = row['id']
+    suanshi = row['infocontent']
+    rspcontent = calc_suanshi(suanshi)
+
+    token, ref_url, unique_id = fetch_verify_token_chagang(session, chagang_id)
+
+    resp = session.post(
+        f"{BASE}/TopGps/Report/PlatformQuery/SupplyReply"
+        f"?id={chagang_id}&pop=1&popName=_dialog_window_normal",
+        data={
+            "__RequestVerificationToken": token,
+            "UniqueId": unique_id,
+            "GovId": "116.113.104.69:8085",
+            "QueryType": "2",
+            "QueryId": row['roadtransportid'],
+            "InfoContent": row['infocontent'],
+            "ReceiveTime": row['receivetime'],
+            "AnswerTime": '0',
+            "InfoId": row['infoid'],
+            "OrderId": row['infoid'],
+            "rspContent": rspcontent,
+            "X-Requested-With": 'XMLHttpRequest'
+        },
+        headers={
+            "Referer": ref_url,
+            "Origin": BASE,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        },
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.text
+
+
+def process_chagang(
+        session: requests.Session,
+        begin_time: str,
+        end_time: str,
+        org_id: str = "1",
+        page_size: int = 50,
+        dry_run: bool = False,
+        all_pages: bool = True,
+        log: Callable[[str], None] = print,
+    ) -> int:
+    """执行一轮完整的查询 + 补充处理，返回本轮实际处理的行数。
+
+    通过 ``log`` 回调输出进度，便于 CLI（print）与 GUI（日志窗口）复用同一逻辑。
+    调用方需保证 ``session`` 已经登录。
+    """
+    extra = {"OrgAndCarList.OrgId": org_id}
+
+    total_done = 0
+    page = 1
+    while True:
+        log(f"查询第 {page} 页 ({begin_time} ~ {end_time}) ...")
+        data = search_chagang(
+            session,
+            begin_time=begin_time,
+            end_time=end_time,
+            page=page,
+            rows=page_size,
+            extra=extra,
+        )
+        rows = data.get("rows") or []
+        total = int(data.get("total") or 0)
+        log(f"  本页 {len(rows)} 行 / 共 {total} 行")
+        if not rows:
+            break
+
+        if not dry_run:
+            for row in rows:
+                try:
+                    resp_text = supplement_chagang(session, row)
+                    log(f"  提交完成: {resp_text[:200]}")
+                    total_done += 1
+                except Exception as e:
+                    print(f"出错: {e}", file=sys.stderr)
+                    continue
+
+        else:
+            log("  [dry-run] 跳过提交")
+
+        if not all_pages:
+            break
+        if page * page_size >= total:
+            break
+        page += 1
+        time.sleep(0.5)
+
+    return total_done
+
+
 def process_all(
         session: requests.Session,
         begin_time: str,
@@ -526,6 +714,7 @@ def process_all(
     ``on_error`` 回调（例如重新登录），会先调用它再继续下一类。
     """
     tasks: list[tuple[str, Callable[..., int]]] = []
+    tasks.append(("查岗", process_chagang))
     if run_type1:
         tasks.append(("类型1·报警处理", process_once))
     if run_type2:
