@@ -35,7 +35,7 @@ import re
 import sys
 import time
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Callable
 
 import requests
@@ -549,7 +549,7 @@ def process_once2(
 def fetch_verify_token_chagang(session: requests.Session, chagang_id: str):
     """打开 SupplyReply 弹窗页，从返回的 HTML 中抓 __RequestVerificationToken。"""
     url = (
-        f"{BASE}/TopGps/Report/PlatformQuery/SupplyReply?id={chagang_id}pop=1&popName=_dialog_window_normal"
+        f"{BASE}/TopGps/Report/PlatformQuery/SupplyReply?id={chagang_id}&pop=1&popName=_dialog_window_normal"
     )
     resp = session.get(
         url,
@@ -578,7 +578,7 @@ def calc_suanshi(suanshi: str) -> str:
         calc_expression("10-7=")  -> "3"
     """
     # 去掉末尾的等号
-    expr = expr.strip().rstrip("=")
+    expr = suanshi.strip().rstrip("=")
     
     # 解析运算符和数字
     for op in ("+", "-"):
