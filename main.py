@@ -594,7 +594,8 @@ def calc_suanshi(suanshi: str) -> str:
 
 def supplement_chagang(
         session: requests.Session,
-        row: dict
+        row: dict,
+        log: Callable[[str], None] = print,
     ) -> str:
     """对给定的查岗行执行"补充处理"。返回响应文本。"""
     if not row:
@@ -605,24 +606,31 @@ def supplement_chagang(
     rspcontent = calc_suanshi(suanshi)
 
     token, ref_url, unique_id = fetch_verify_token_chagang(session, chagang_id)
+    tt = time.time()
+    rd = f'{(tt - int(tt)):.16f}'
+
+    body = [
+        ("__RequestVerificationToken", token,),
+        ("UniqueId", unique_id,),
+        ("GovId", "116.113.104.69:8085",),
+        ("QueryType", "2",),
+        ("QueryId", '150200006057',),
+        ("GovId", "116.113.104.69:8085",),
+        ("InfoContent", row['infocontent'],),
+        ("ReceiveTime", row['receivetime'],),
+        ("AnswerTime", '0',),
+        ("InfoId", row['infoid'],),
+        ("OrderId", row['infoid'],),
+        ("rspContent", rspcontent,),
+        ("X-Requested-With", 'XMLHttpRequest',),
+    ]
+
+    log(f"  提交body: {body}")
 
     resp = session.post(
         f"{BASE}/TopGps/Report/PlatformQuery/SupplyReply"
-        f"?id={chagang_id}&pop=1&popName=_dialog_window_normal",
-        data={
-            "__RequestVerificationToken": token,
-            "UniqueId": unique_id,
-            "GovId": "116.113.104.69:8085",
-            "QueryType": "2",
-            "QueryId": row['roadtransportid'],
-            "InfoContent": row['infocontent'],
-            "ReceiveTime": row['receivetime'],
-            "AnswerTime": '0',
-            "InfoId": row['infoid'],
-            "OrderId": row['infoid'],
-            "rspContent": rspcontent,
-            "X-Requested-With": 'XMLHttpRequest'
-        },
+        f"?id={chagang_id}&rd={rd}&pop=1&popName=_dialog_window_normal",
+        data=body,
         headers={
             "Referer": ref_url,
             "Origin": BASE,
@@ -672,7 +680,7 @@ def process_chagang(
         if not dry_run:
             for row in rows:
                 try:
-                    resp_text = supplement_chagang(session, row)
+                    resp_text = supplement_chagang(session, row, log)
                     log(f"  提交完成: {resp_text[:200]}")
                     total_done += 1
                 except Exception as e:
