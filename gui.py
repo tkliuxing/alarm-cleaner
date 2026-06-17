@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""报警自动处理 GUI。
+"""报警自动处理 GUI（新平台 Vue + API 版）。
 
 在 Windows 上双击运行（或 ``python gui.py``）：
-  1. 输入用户名 / 密码，点击「开始」后登录平台；
+  1. 输入用户名 / 密码，点击「开始」后登录新平台；
   2. 登录成功后每隔设定的分钟数（默认 10 分钟）自动处理一次
-     「今天 00:00 ~ 当前时刻」的全部报警；
+     「今天 00:00 ~ 当前时刻」的报警 / 查岗；
   3. 处理过程实时显示在窗口中，同时写入 ``logs/`` 目录下的日志文件。
 
-核心 HTTP 逻辑全部复用 ``main.py``，本文件只负责界面与定时调度。
+底层逻辑复用 ``api_client.CgoApiClient`` + ``processors``，本文件只负责界面与定时调度。
+勾选「干跑（只查询不提交）」时只查询、绝不真实销账/应答。
 """
 from __future__ import annotations
 
@@ -21,7 +22,8 @@ import tkinter as tk
 from datetime import datetime
 from tkinter import messagebox, scrolledtext, ttk
 
-import main as core
+import processors
+from api_client import CgoApiClient
 
 LOGGER_NAME = "alarm-cleaner"
 DEFAULT_INTERVAL_MIN = 10
@@ -87,18 +89,18 @@ class AlarmCleanerApp:
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
-        self.root.title("报警自动处理")
-        self.root.geometry("760x560")
-        self.root.minsize(640, 460)
+        self.root.title("报警自动处理（新平台）")
+        self.root.geometry("760x580")
+        self.root.minsize(640, 480)
 
         self.user_var = tk.StringVar(value="")
         self.pwd_var = tk.StringVar(value="")
         self.interval_var = tk.StringVar(value=str(DEFAULT_INTERVAL_MIN))
-        self.org_var = tk.StringVar(value="7250")
-        self.pagesize_var = tk.StringVar(value="50")
-        self.dryrun_var = tk.BooleanVar(value=False)
+        self.pagesize_var = tk.StringVar(value="200")
+        self.dryrun_var = tk.BooleanVar(value=True)
         self.type1_var = tk.BooleanVar(value=True)
         self.type2_var = tk.BooleanVar(value=True)
+        self.chagang_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="已停止")
 
         pad = {"padx": 6, "pady": 4}
@@ -120,18 +122,14 @@ class AlarmCleanerApp:
         self.interval_entry = ttk.Entry(form, textvariable=self.interval_var, width=10)
         self.interval_entry.grid(row=1, column=1, sticky="w", **pad)
 
-        ttk.Label(form, text="组织ID").grid(row=1, column=2, sticky="w", **pad)
-        self.org_entry = ttk.Entry(form, textvariable=self.org_var, width=10)
-        self.org_entry.grid(row=1, column=3, sticky="w", **pad)
-
-        ttk.Label(form, text="每页行数").grid(row=2, column=0, sticky="w", **pad)
+        ttk.Label(form, text="每页行数").grid(row=1, column=2, sticky="w", **pad)
         self.pagesize_entry = ttk.Entry(form, textvariable=self.pagesize_var, width=10)
-        self.pagesize_entry.grid(row=2, column=1, sticky="w", **pad)
+        self.pagesize_entry.grid(row=1, column=3, sticky="w", **pad)
 
         self.dryrun_check = ttk.Checkbutton(
-            form, text="干跑（只查询不提交）", variable=self.dryrun_var
+            form, text="干跑（只查询不提交，安全）", variable=self.dryrun_var
         )
-        self.dryrun_check.grid(row=2, column=2, columnspan=2, sticky="w", **pad)
+        self.dryrun_check.grid(row=2, column=0, columnspan=4, sticky="w", **pad)
 
         ttk.Label(form, text="处理类型").grid(row=3, column=0, sticky="w", **pad)
         self.type1_check = ttk.Checkbutton(
@@ -141,7 +139,11 @@ class AlarmCleanerApp:
         self.type2_check = ttk.Checkbutton(
             form, text="类型2·安全报警", variable=self.type2_var
         )
-        self.type2_check.grid(row=3, column=2, columnspan=2, sticky="w", **pad)
+        self.type2_check.grid(row=3, column=2, sticky="w", **pad)
+        self.chagang_check = ttk.Checkbutton(
+            form, text="查岗应答", variable=self.chagang_var
+        )
+        self.chagang_check.grid(row=3, column=3, sticky="w", **pad)
 
         # 按钮 + 状态
         bar = ttk.Frame(self.root)
@@ -150,9 +152,7 @@ class AlarmCleanerApp:
         self.start_btn.pack(side="left")
         self.stop_btn = ttk.Button(bar, text="停止", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left", padx=(8, 0))
-        ttk.Label(bar, textvariable=self.status_var, foreground="#0a64c8").pack(
-            side="right"
-        )
+        ttk.Label(bar, textvariable=self.status_var, foreground="#0a64c8").pack(side="right")
 
         # 日志窗口
         log_frame = ttk.LabelFrame(self.root, text="运行日志")
@@ -176,35 +176,32 @@ class AlarmCleanerApp:
         except ValueError:
             messagebox.showwarning("提示", "间隔必须是大于 0 的数字（分钟）。")
             return
-        org_id = self.org_var.get().strip() or "1"
         try:
             page_size = int(self.pagesize_var.get())
             if page_size <= 0:
                 raise ValueError
         except ValueError:
-            page_size = 50
-            self.pagesize_var.set("50")
+            page_size = 200
+            self.pagesize_var.set("200")
         dry_run = bool(self.dryrun_var.get())
         run_type1 = bool(self.type1_var.get())
         run_type2 = bool(self.type2_var.get())
-        if not (run_type1 or run_type2):
+        run_chagang = bool(self.chagang_var.get())
+        if not (run_type1 or run_type2 or run_chagang):
             messagebox.showwarning("提示", "请至少选择一种处理类型。")
             return
+        if not dry_run:
+            if not messagebox.askokcancel(
+                "确认", "未勾选「干跑」，将对平台进行真实销账 / 查岗应答，确定继续？"
+            ):
+                return
 
         self.stop_event.clear()
         self._set_running(True)
         self.worker = threading.Thread(
             target=self._worker,
-            args=(
-                username,
-                password,
-                org_id,
-                page_size,
-                interval,
-                dry_run,
-                run_type1,
-                run_type2,
-            ),
+            args=(username, password, page_size, interval, dry_run,
+                  run_type1, run_type2, run_chagang),
             daemon=True,
         )
         self.worker.start()
@@ -227,29 +224,28 @@ class AlarmCleanerApp:
         self,
         username: str,
         password: str,
-        org_id: str,
         page_size: int,
         interval: float,
         dry_run: bool,
         run_type1: bool,
         run_type2: bool,
+        run_chagang: bool,
     ) -> None:
         log = self.logger.info
+        client = CgoApiClient(log=log)
         try:
-            session = core.make_session()
             log(f"正在登录：{username} ...")
-            core.login(session, username, password)
-            log("登录成功。")
+            client.login(username, password)
         except Exception as exc:  # noqa: BLE001 - 登录失败需展示给用户
             self.logger.error(f"登录失败：{exc}")
             self.root.after(0, self._on_worker_stopped)
             return
 
         def relogin(_exc: Exception) -> None:
-            """某一类处理失败时（多为 session 过期）在原 session 上重新登录。"""
+            """某一类处理失败时（多为 token 过期）重新登录。"""
             log("尝试重新登录 ...")
             try:
-                core.login(session, username, password)
+                client.login(username, password)
                 log("重新登录成功。")
             except Exception as exc2:  # noqa: BLE001
                 self.logger.error(f"重新登录失败：{exc2}")
@@ -257,29 +253,26 @@ class AlarmCleanerApp:
         cycle = 0
         while not self.stop_event.is_set():
             cycle += 1
-            begin, end = core.today_time_window()
-            log(f"===== 第 {cycle} 轮开始（{begin} ~ {end}）=====")
-            done = core.process_all(
-                session,
-                begin_time=begin,
-                end_time=end,
-                org_id=org_id,
+            begin, end = processors.today_time_window()
+            mode = "干跑" if dry_run else "真实提交"
+            log(f"===== 第 {cycle} 轮开始（{mode}，{begin} ~ {end}）=====")
+            done = processors.process_all(
+                client, begin, end,
                 page_size=page_size,
                 dry_run=dry_run,
-                all_pages=True,
-                log=log,
                 run_type1=run_type1,
                 run_type2=run_type2,
+                run_chagang=run_chagang,
+                log=log,
                 on_error=relogin,
             )
-            log(f"第 {cycle} 轮完成，本轮处理 {done} 行。")
+            log(f"第 {cycle} 轮完成，本轮涉及 {done} 条。")
 
             if self.stop_event.is_set():
                 break
 
             self.next_run_ts = time.time() + interval * 60
             log(f"等待 {interval:g} 分钟后进行下一轮 ...")
-            # stop_event.wait 在收到停止信号时立即返回，保证「停止」按钮响应及时。
             self.stop_event.wait(interval * 60)
             self.next_run_ts = None
 
@@ -293,11 +286,11 @@ class AlarmCleanerApp:
             self.user_entry,
             self.pwd_entry,
             self.interval_entry,
-            self.org_entry,
             self.pagesize_entry,
             self.dryrun_check,
             self.type1_check,
             self.type2_check,
+            self.chagang_check,
         ):
             widget.config(state=state)
         self.start_btn.config(state="disabled" if running else "normal")
