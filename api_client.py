@@ -250,6 +250,14 @@ class CgoApiClient:
             return v["_value"]
         return v
 
+    @staticmethod
+    def _cell_suffix(row: dict, suffix: str) -> Any:
+        """按列名后缀取值（动态报表列名带 fs_<id>_<group>_ 前缀，如 _user_id）。"""
+        for k, v in row.items():
+            if k.endswith(suffix):
+                return v["_value"] if isinstance(v, dict) and "_value" in v else v
+        return None
+
     @classmethod
     def row_to_alarm_base(cls, row: dict) -> dict:
         """报表行 → alarmHandle.alarmBaseDataList 项。"""
@@ -339,8 +347,8 @@ class CgoApiClient:
         """
         cond = [
             self.dynamic_time_condition(TIME_FIELD_CHAGANG, begin, end),
-            {"fieldType": "select", "fieldCode": "query_type", "symbol": "equal", "value": 1},
-            {"fieldType": "switch", "fieldCode": "responded", "symbol": "equal", "value": 0},
+            # {"fieldType": "select", "fieldCode": "query_type", "symbol": "equal", "value": 1},
+            # {"fieldType": "switch", "fieldCode": "responded", "symbol": "equal", "value": 0},
         ]
         return self.query_report(LIST_ID_CHAGANG, cond, page_size=page_size)
 
@@ -374,7 +382,8 @@ class CgoApiClient:
         req_time = self._cell(row, "rece_time") or self._cell(row, "fs_67764_222_req_time") or ""
         cmd_params = {
             "objectType": self._cell(row, "query_type"),
-            "responder": responder or self.username or "",
+            # 登录接口不返回企业名；优先入参/登录名，回退记录行的应答人列（…_user_id）。
+            "responder": responder or self.username or self._cell_suffix(row, "_user_id") or "",
             "responderTel": "",
             "objectId": self._cell(row, "query_id"),
             "infoId": self._cell(row, "info_id"),
@@ -385,6 +394,7 @@ class CgoApiClient:
             "rspSource": RSP_SOURCE_BROWSER,
             "rspIp": "",
             "sourceDataType": CHAGANG_SOURCE_DATA_TYPE,
+            "sourceMsgSn": self._cell(row, "info_id"),   # 实测：= infoId
             "reqUniqueId": self._cell(row, "unique_id"),
             "reqTime": self._ms(req_time) if req_time else 0,
         }
@@ -465,39 +475,47 @@ class CgoApiClient:
             return int(time.time() * 1000)
 
         def on_open(ws):
-            self.log(f"WS 已连接 {ws_url}，等待 clientId ...")
+            # 实测：服务端不主动推送 clientId，须由客户端先发 login（空 body）。
+            login = {"action": "login", "time": now_ms(), "version": 1,
+                     "orderId": order_id("login"), "body": {}}
+            ws.send(json.dumps(login))
+            self.log(f"WS 已连接 {ws_url}，已发送 login，等待 loginRsp ...")
 
         def on_message(ws, message):
             try:
                 msg = json.loads(message)
             except Exception:
                 return
-            # 服务端首帧带 clientId → 登录
-            cid = msg.get("clientId") or (msg.get("body") or {}).get("clientId")
-            if cid and not state["client_id"]:
-                state["client_id"] = cid
-                login = {"action": "login", "time": now_ms(), "version": 1,
-                         "orderId": order_id("login"), "body": {"clientId": cid}}
-                ws.send(json.dumps(login))
-                self.log(f"WS 收到 clientId，已发送 login。")
-                return
-            # 登录成功（约定：rspCode==0 或带 login 标识）后下发指令
-            if not state["logged_in"] and (msg.get("action") == "login" or msg.get("rspCode") == 0):
+            action = msg.get("action")
+            # 登录应答：loginRsp(rspCode==0)，data.clientId = userId#hash。登录成功后下发指令。
+            if not state["logged_in"] and action == "loginRsp" and msg.get("rspCode") == 0:
                 state["logged_in"] = True
+                state["client_id"] = (msg.get("data") or {}).get("clientId")
+                self.log(f"WS 登录成功 clientId={state['client_id']}，下发 {len(frames)} 条 ...")
                 for fr in frames:
                     fr = dict(fr)
                     fr["time"] = now_ms()
                     fr["orderId"] = order_id("sendCmd")
                     ws.send(json.dumps(fr))
                     state["sent"] += 1
-                self.log(f"WS 已下发 {state['sent']} 条查岗应答，等待回执 ...")
-                return
-            # 指令回执
-            if msg.get("action") == "sendCmd":
-                state["ack"] += 1
-                self.log(f"  应答回执: rspCode={msg.get('rspCode')} msg={msg.get('msg')}")
-                if state["ack"] >= state["sent"]:
+                if not frames:
                     state["done"].set()
+                return
+            # 指令回执（实测三段：sendCmdRsp 待提交 → cmdComRsp 已提交 → cmdDevRsp 下发成功）
+            if action in ("sendCmdRsp", "cmdComRsp", "cmdDevRsp"):
+                data = msg.get("data") or {}
+                inner = data.get("rspCode")
+                self.log(
+                    f"  应答回执[{action}]: rspCode={inner} msg={data.get('msg')} "
+                    f"cmdId={data.get('cmdId')}"
+                )
+                # cmdDevRsp 为终态（rspCode 201=下发成功,无需应答）；
+                # sendCmdRsp 阶段若 rspCode!=0 表示直接失败，也计为终态避免阻塞。
+                terminal = action == "cmdDevRsp" or (action == "sendCmdRsp" and inner not in (0, None))
+                if terminal:
+                    state["ack"] += 1
+                    if state["ack"] >= state["sent"]:
+                        state["done"].set()
 
         def on_error(ws, err):
             self.log(f"WS 错误: {err}")
