@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import threading
 import time
 from datetime import datetime
 from typing import Any, Callable
@@ -92,6 +93,17 @@ class CgoApiClient:
         self.refresh_token: str | None = None
         self.user_id: str | None = None
         self.username: str | None = None   # 用于查岗应答 responder（企业/用户名）
+
+        # 持久 WebSocket（查岗应答下发）。登录后调用 connect_ws() 预先建链，
+        # 之后 reply_chagang 直接复用同一条连接，无需现连现登。
+        self._ws = None
+        self._ws_thread: threading.Thread | None = None
+        self._ws_lock = threading.Lock()           # 串行化建链 / 发送批次
+        self._ws_logged_in = threading.Event()     # loginRsp 成功后置位
+        self._ws_client_id: str | None = None
+        self._ws_token: str | None = None          # 当前连接所用 accessToken
+        self._ws_order: dict[str, int] = {}        # orderId 计数（按 action）
+        self._ws_batch: dict | None = None         # 当前在途发送批次的回执统计
 
     # ------------------------------------------------------------------ 基础
     def _url(self, path: str) -> str:
@@ -447,37 +459,64 @@ class CgoApiClient:
 
         return self._ws_send_cmds(frames, timeout=timeout)
 
-    def _ws_send_cmds(self, frames: list[dict], *, timeout: float = 15.0) -> int:
-        """连接 WS → 等待 clientId → login → 依次 sendCmd。返回发送条数。
+    def _ws_order_id(self, action: str) -> int:
+        """按 action 递增的 orderId（同一连接内对 login / sendCmd 各自单调递增）。"""
+        self._ws_order[action] = self._ws_order.get(action, 0) + 1
+        return self._ws_order[action]
 
-        说明：``clientId`` 由服务端在连接后首帧下发；登录后才能发指令。
-        WS 协议细节见设计文档 §5.6，首次联调建议打开 trace 观察服务端回推。
+    def connect_ws(self, *, timeout: float = 15.0) -> None:
+        """建立**持久** WebSocket 连接并完成 login，供查岗应答复用。
+
+        幂等：同一 token 且后台线程仍存活时直接复用（线程可能正在自动重连，
+        此时仅在锁外等待登录态恢复）。建议登录成功后立即调用，这样查岗应答时
+        无需现连现登，显著降低首条应答的下发延迟。
+
+        断线由 websocket-client 的 ``run_forever(reconnect=...)`` 在后台自动重连，
+        每次重连都会重新走 on_open→login→loginRsp，连接因此保持热态。
+
+        协议（实测，见设计文档 §5.6）：连接后客户端先发 login（空 body），
+        服务端回 loginRsp(rspCode==0) 并在 data.clientId 下发分配的 clientId。
+        ``access_token`` 作为 WebSocket 子协议用于鉴权。
         """
-        import json
-        import threading
-
-        import websocket  # websocket-client
-
         if not self.access_token:
             raise ApiError("未登录，无法建立 WebSocket")
 
+        with self._ws_lock:
+            alive = (self._ws is not None and self._ws_token == self.access_token
+                     and self._ws_thread is not None and self._ws_thread.is_alive())
+            if not alive:
+                # 首次 / token 变化 / 线程已死 → 重建连接（内部会先清理旧连接）。
+                self._build_ws_locked()
+
+        # 锁外等待登录完成（含后台重连恢复），避免阻塞回调线程。
+        if not self._ws_logged_in.wait(timeout):
+            raise ApiError("WebSocket 登录/重连超时")
+
+    def _build_ws_locked(self) -> None:
+        """（重新）建立 WebSocket 连接并启动后台线程。调用方须持有 self._ws_lock。"""
+        import json
+
+        import websocket  # websocket-client
+
+        self._close_ws_locked()
+        self._ws_logged_in.clear()
+        self._ws_client_id = None
+        self._ws_order = {}
+        self._ws_token = self.access_token
+
         host = self.base.split("//", 1)[-1].split(":")[0].split("/")[0]
         ws_url = f"ws://{host}:{WS_PORT}/ws"
-
-        state = {"client_id": None, "logged_in": False, "sent": 0, "done": threading.Event(),
-                 "order": {}, "ack": 0}
-
-        def order_id(action: str) -> int:
-            state["order"][action] = state["order"].get(action, 0) + 1
-            return state["order"][action]
 
         def now_ms() -> int:
             return int(time.time() * 1000)
 
         def on_open(ws):
             # 实测：服务端不主动推送 clientId，须由客户端先发 login（空 body）。
+            # 每次（重）连都会触发，故自动重连后会重新登录。
+            self._ws_logged_in.clear()
+            self._ws_order = {}
             login = {"action": "login", "time": now_ms(), "version": 1,
-                     "orderId": order_id("login"), "body": {}}
+                     "orderId": self._ws_order_id("login"), "body": {}}
             ws.send(json.dumps(login))
             self.log(f"WS 已连接 {ws_url}，已发送 login，等待 loginRsp ...")
 
@@ -487,19 +526,11 @@ class CgoApiClient:
             except Exception:
                 return
             action = msg.get("action")
-            # 登录应答：loginRsp(rspCode==0)，data.clientId = userId#hash。登录成功后下发指令。
-            if not state["logged_in"] and action == "loginRsp" and msg.get("rspCode") == 0:
-                state["logged_in"] = True
-                state["client_id"] = (msg.get("data") or {}).get("clientId")
-                self.log(f"WS 登录成功 clientId={state['client_id']}，下发 {len(frames)} 条 ...")
-                for fr in frames:
-                    fr = dict(fr)
-                    fr["time"] = now_ms()
-                    fr["orderId"] = order_id("sendCmd")
-                    ws.send(json.dumps(fr))
-                    state["sent"] += 1
-                if not frames:
-                    state["done"].set()
+            # 登录应答：loginRsp(rspCode==0)，data.clientId = userId#hash。
+            if action == "loginRsp" and msg.get("rspCode") == 0:
+                self._ws_client_id = (msg.get("data") or {}).get("clientId")
+                self._ws_logged_in.set()
+                self.log(f"WS 登录成功 clientId={self._ws_client_id}")
                 return
             # 指令回执（实测三段：sendCmdRsp 待提交 → cmdComRsp 已提交 → cmdDevRsp 下发成功）
             if action in ("sendCmdRsp", "cmdComRsp", "cmdDevRsp"):
@@ -509,16 +540,25 @@ class CgoApiClient:
                     f"  应答回执[{action}]: rspCode={inner} msg={data.get('msg')} "
                     f"cmdId={data.get('cmdId')}"
                 )
+                batch = self._ws_batch
+                if batch is None:
+                    return
                 # cmdDevRsp 为终态（rspCode 201=下发成功,无需应答）；
                 # sendCmdRsp 阶段若 rspCode!=0 表示直接失败，也计为终态避免阻塞。
-                terminal = action == "cmdDevRsp" or (action == "sendCmdRsp" and inner not in (0, None))
+                terminal = action == "cmdDevRsp" or (
+                    action == "sendCmdRsp" and inner not in (0, None))
                 if terminal:
-                    state["ack"] += 1
-                    if state["ack"] >= state["sent"]:
-                        state["done"].set()
+                    batch["ack"] += 1
+                    if batch["ack"] >= batch["sent"]:
+                        batch["done"].set()
 
         def on_error(ws, err):
             self.log(f"WS 错误: {err}")
+
+        def on_close(ws, code, reason):
+            # 连接断开后清除登录态；reconnect>0 时 run_forever 会自动重连。
+            self._ws_logged_in.clear()
+            self.log(f"WS 连接关闭 code={code} reason={reason}（将自动重连）")
 
         ws = websocket.WebSocketApp(
             ws_url,
@@ -526,15 +566,64 @@ class CgoApiClient:
             on_open=on_open,
             on_message=on_message,
             on_error=on_error,
+            on_close=on_close,
         )
-        t = threading.Thread(target=ws.run_forever, kwargs={"ping_interval": 20}, daemon=True)
-        t.start()
-        state["done"].wait(timeout)
-        try:
-            ws.close()
-        except Exception:
-            pass
-        return state["sent"]
+        self._ws = ws
+        # reconnect=5：断线后每 5s 自动重连；ping 用于及时探测半开连接。
+        self._ws_thread = threading.Thread(
+            target=ws.run_forever,
+            kwargs={"ping_interval": 20, "ping_timeout": 10, "reconnect": 5},
+            daemon=True,
+        )
+        self._ws_thread.start()
+
+    def _close_ws_locked(self) -> None:
+        """关闭当前连接（调用方须持有 self._ws_lock）。"""
+        if self._ws is not None:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+        self._ws = None
+        self._ws_thread = None
+        self._ws_logged_in.clear()
+
+    def close_ws(self) -> None:
+        """主动关闭持久 WebSocket 连接（程序退出 / 停止时调用）。"""
+        with self._ws_lock:
+            self._close_ws_locked()
+
+    def _ws_send_cmds(self, frames: list[dict], *, timeout: float = 15.0) -> int:
+        """在持久连接上依次 sendCmd，并等待回执。返回发送条数。
+
+        若尚未建链（或连接已断 / token 变更），会先 ``connect_ws()`` 自动建链，
+        因此既可由 ``connect_ws()`` 预热，也可在首次发送时惰性建链。
+        """
+        import json
+
+        if not frames:
+            return 0
+
+        self.connect_ws(timeout=timeout)  # 幂等：已连接则立即返回
+
+        with self._ws_lock:
+            ws = self._ws
+            if ws is None or not self._ws_logged_in.is_set():
+                raise ApiError("WebSocket 未就绪，无法下发查岗应答")
+            batch: dict = {"sent": 0, "ack": 0, "done": threading.Event()}
+            self._ws_batch = batch
+            self.log(f"WS 下发 {len(frames)} 条查岗应答 ...")
+            for fr in frames:
+                fr = dict(fr)
+                fr["time"] = int(time.time() * 1000)
+                fr["orderId"] = self._ws_order_id("sendCmd")
+                ws.send(json.dumps(fr))
+                batch["sent"] += 1
+
+        batch["done"].wait(timeout)
+        sent = batch["sent"]
+        self._ws_batch = None
+        return sent
 
 
 _cmd_seq = 0

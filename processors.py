@@ -15,7 +15,7 @@
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable
 
 from api_client import (
@@ -29,10 +29,14 @@ from api_client import (
 
 
 def today_time_window() -> tuple[str, str]:
-    """返回「今天 00:00:00 ~ 当前时刻」的时间窗。"""
+    """返回「前一天 00:00:00 ~ 当天 24:00:00」的时间窗（共 48 小时）。
+
+    end 取「当天 24 点」，即次日 00:00:00。
+    """
     now = datetime.now()
-    begin = now.replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
-    end = now.strftime("%Y-%m-%d %H:%M:%S")
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    begin = (midnight - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+    end = (midnight + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
     return begin, end
 
 

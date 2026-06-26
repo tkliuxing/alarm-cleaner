@@ -62,10 +62,21 @@ def main(argv: list[str] | None = None) -> int:
     try:
         log(f"登录 {args.user} ...")
         client.login(args.user, args.password)
+        if args.chagang and not dry_run:
+            # 预先建立查岗应答的 WebSocket 长连接（失败不阻断主流程，发送时会惰性重连）。
+            try:
+                client.connect_ws()
+            except Exception as exc:  # noqa: BLE001
+                log(f"预连接查岗 WebSocket 失败（将于下发时重试）：{exc}")
 
         def relogin(_exc: Exception) -> None:
             log("尝试重新登录 ...")
             client.login(args.user, args.password)
+            if args.chagang and not dry_run:
+                try:
+                    client.connect_ws()
+                except Exception as exc:  # noqa: BLE001
+                    log(f"重连查岗 WebSocket 失败（将于下发时重试）：{exc}")
 
         log(f"{'[干跑] ' if dry_run else ''}处理时间窗：{begin} ~ {end}")
         total = processors.process_all(

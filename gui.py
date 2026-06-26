@@ -241,12 +241,21 @@ class AlarmCleanerApp:
             self.root.after(0, self._on_worker_stopped)
             return
 
+        if run_chagang and not dry_run:
+            # 预先建立查岗应答 WebSocket 长连接（失败不阻断，下发时会惰性重连）。
+            try:
+                client.connect_ws()
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning(f"预连接查岗 WebSocket 失败（将于下发时重试）：{exc}")
+
         def relogin(_exc: Exception) -> None:
             """某一类处理失败时（多为 token 过期）重新登录。"""
             log("尝试重新登录 ...")
             try:
                 client.login(username, password)
                 log("重新登录成功。")
+                if run_chagang and not dry_run:
+                    client.connect_ws()
             except Exception as exc2:  # noqa: BLE001
                 self.logger.error(f"重新登录失败：{exc2}")
 
@@ -276,6 +285,7 @@ class AlarmCleanerApp:
             self.stop_event.wait(interval * 60)
             self.next_run_ts = None
 
+        client.close_ws()
         log("已停止运行。")
         self.root.after(0, self._on_worker_stopped)
 
