@@ -366,10 +366,17 @@ class CgoApiClient:
 
     @staticmethod
     def chagang_unanswered(row: dict) -> bool:
-        v = row.get("responded")
-        if isinstance(v, dict):
-            return not v.get("_value")
-        return not v
+        """判断查岗记录是否「未应答」。
+
+        ⚠️ 实测：``responded`` 字段对已应答 / 未应答记录**都返回「是」（_value=true）**，
+        不能作为判据（见 2026-06-26 抓包：未应答的 info_id 1366648 同样 responded=是）。
+        真正区分在于「是否已有应答结果」——已应答记录带 rsp_result（如 201 下发成功）、
+        rsp_time、rsp_content 等列，未应答记录则没有这些列。
+        故以「既无应答结果、也无应答时间」判定为未应答。
+        """
+        rsp_result = CgoApiClient._cell_suffix(row, "_rsp_result")
+        rsp_time = CgoApiClient._cell_suffix(row, "_rsp_time")
+        return rsp_result in (None, "") and rsp_time in (None, "")
 
     @staticmethod
     def calc_suanshi(expr: str) -> str:
